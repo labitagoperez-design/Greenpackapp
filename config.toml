@@ -1,0 +1,12 @@
+[theme]
+# Deja estas opciones en blanco para que Streamlit tome 
+# automáticamente la configuración del sistema del usuario.
+base="auto" 
+primaryColor="#2e5a27" # El verde oscuro de tu marca
+backgroundColor="#ffffff"
+secondaryBackgroundColor="#f9fced"
+textColor="#31333F"
+font="sans serif"
+[theme]
+base="auto"
+primaryColor="#2e5a27"

@@ -1,0 +1,10 @@
+# Archivos temporales de Python
+__pycache__/
+*.pyc
+
+# Copias locales de los Excel de la planta (Protección de datos)
+*_local.xlsx
+*_libre.xlsx
+
+# Base de datos local (Opcional, por si preferís que no se suba a internet)
+*.db

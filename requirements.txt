@@ -1,0 +1,6 @@
+streamlit
+pandas
+openpyxl
+msoffcrypto-tool
+plotly
+streamlit-option-menu
