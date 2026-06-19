@@ -1,10 +1,11 @@
-# Archivos temporales de Python
-__pycache__/
-*.pyc
+# Ignorar temporales de Excel
+~$*.xlsx
+~$*.xls
 
-# Copias locales de los Excel de la planta (Protección de datos)
-*_local.xlsx
-*_libre.xlsx
+# Ignorar entornos virtuales de Python (si usás uv o venv)
+.venv/
+.uv/
 
-# Base de datos local (Opcional, por si preferís que no se suba a internet)
-*.db
+# Archivos del sistema
+Thumbs.db
+desktop.ini
