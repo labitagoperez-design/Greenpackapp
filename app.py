@@ -11,6 +11,7 @@ import formulas as fm
 import plotly.express as px
 import plotly.graph_objects as go
 import io 
+import shutil
 from datetime import date, datetime, timedelta
 import mod_personal as pers_mod
 import mod_romaneo as rom_mod
@@ -19,6 +20,8 @@ import mod_importar as imp
 import mod_usuarios as mu
 import mod_produccion as prod_mod 
 from mod_gerencia import mostrar_dashboard_gerencial
+from streamlit_autorefresh import st_autorefresh
+
 
 
 
@@ -29,7 +32,15 @@ SERVIDOR_PATH = r"Y:"
 DB_PATH = os.path.join(SERVIDOR_PATH, 'greenpack_v4.db') # Mantenemos v4 como tenías
 CARPETA_PROCESADOS = os.path.join(SERVIDOR_PATH, 'procesados')
 
-
+# ==============================================================================
+# ⏱️ MOTOR DE AUTO-REFRESCO AUTOMÁTICO (Cada 2 minutos)
+# ==============================================================================
+# Esto hace que app.py corra solo en segundo plano para chupar los Excel sin congelar la pantalla
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=120000, key="reloj_puente_greenpack")
+except ImportError:
+    st.sidebar.warning("⚠️ Instalá 'streamlit-autorefresh' en el servidor para activar el tiempo real.")
 
 # --- AQUÍ AGREGÁS LA FUNCIÓN MAESTRA ---
 def guardar_datos_universal(datos_dict, tabla_nombre):
@@ -53,7 +64,112 @@ def guardar_datos_universal(datos_dict, tabla_nombre):
         st.error(f"Error al guardar en {tabla_nombre}: {e}")
         return False
 
+# --- FUNCIÓN DE CONEXIÓN MAESTRA (Agregada para el puente) ---
+def conectar_db():
+    return sqlite3.connect(DB_PATH)
 
+# ==============================================================================
+# 🚀 EL PUENTE EN CALIENTE (Sincronización silenciosa en segundo plano)
+# ==============================================================================
+ruta_red_parte = r"Y:\Despacho\APP_GREENPACK\datos_origen\Parte diario 2025.xlsx"
+ruta_red_volcado = r"Y:\Despacho\APP_GREENPACK\datos_origen\volcado Produccion 2025.xlsx"
+ruta_local_parte = os.path.join(os.getcwd(), "parte_diario_local.xlsx")
+ruta_local_volcado = os.path.join(os.getcwd(), "volcado_local.xlsx")
+ruta_libre_parte = os.path.join(os.getcwd(), "parte_diario_libre.xlsx")
+ruta_libre_volcado = os.path.join(os.getcwd(), "volcado_libre.xlsx")
+
+set_codigos_volcados = set()
+df_excel = None
+
+# A) Copia de seguridad local rápida para no trabar la red Y:\
+try:
+    if os.path.exists(ruta_red_parte):
+        shutil.copy2(ruta_red_parte, ruta_local_parte)
+    if os.path.exists(ruta_red_volcado):
+        shutil.copy2(ruta_red_volcado, ruta_local_volcado)
+except Exception:
+    pass
+
+f_parte_origen = ruta_local_parte if os.path.exists(ruta_local_parte) else ruta_red_parte
+f_volcado_origen = ruta_local_volcado if os.path.exists(ruta_local_volcado) else ruta_red_volcado
+
+# B) Desencriptar archivos usando la clave de Óscar (ROCKO1)
+if os.path.exists(f_parte_origen):
+    import msoffcrypto
+    
+    # Procesamos el volcado de Óscar para saber qué bines ya se usaron
+    if os.path.exists(f_volcado_origen):
+        try:
+            with open(f_volcado_origen, "rb") as f_enc:
+                file_v = msoffcrypto.OfficeFile(f_enc)
+                file_v.load_key(password="ROCKO1")
+                with open(ruta_libre_volcado, "wb") as f_dec:
+                    file_v.decrypt(f_dec)
+            
+            if os.path.exists(ruta_libre_volcado):
+                with pd.ExcelFile(ruta_libre_volcado, engine="openpyxl") as xl_lector:
+                    lista_hojas = xl_lector.sheet_names
+                    pestaña_correcta = [h for h in lista_hojas if "VOLC" in str(h).upper()]
+                    pestaña_final = pestaña_correcta[0] if pestaña_correcta else lista_hojas[0]
+                    df_v_prod = pd.read_excel(xl_lector, sheet_name=pestaña_final)
+                
+                df_v_prod.columns = [str(c).strip().upper() for c in df_v_prod.columns]
+                col_c_v = 'CODIGO' if 'CODIGO' in df_v_prod.columns else df_v_prod.columns[0]
+                set_codigos_volcados = set(df_v_prod[col_c_v].dropna().astype(str).str.strip().str.upper().unique())
+                os.remove(ruta_libre_volcado)
+        except Exception:
+            pass
+
+    # Desencriptamos el Parte Diario principal
+    try:
+        with open(f_parte_origen, "rb") as f_enc:
+            file_p = msoffcrypto.OfficeFile(f_enc)
+            file_p.load_key(password="ROCKO1")
+            with open(ruta_libre_parte, "wb") as f_dec:
+                file_p.decrypt(f_dec)
+        
+        if os.path.exists(ruta_libre_parte):
+            df_excel = pd.read_excel(ruta_libre_parte, sheet_name="PARTE", engine="openpyxl")
+            os.remove(ruta_libre_parte)
+    except Exception:
+        pass
+
+# C) Inyección automática y cruce inteligente directo a tu SQLite en red
+if df_excel is not None:
+    try:
+        df_excel.columns = [str(c).strip().upper() for c in df_excel.columns]
+        df_excel = df_excel[df_excel['CODIGO'].notna()]
+        
+        with conectar_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''CREATE TABLE IF NOT EXISTS tabla_maestra_final (
+                codigo TEXT PRIMARY KEY, fecha TEXT, finca TEXT, cantidad REAL, destino TEXT, visual TEXT, volcado INTEGER
+            )''')
+            
+            for _, row in df_excel.iterrows():
+                codigo_clean = str(row.get('CODIGO', '')).strip().upper()
+                if codigo_clean in ['', 'NAN', 'NONE']: continue
+                
+                if codigo_clean in set_codigos_volcados:
+                    volcado_final = 1
+                else:
+                    v_raw = str(row.get('VOLCADO A PROD.', '0')).strip().upper()
+                    volcado_final = 1 if v_raw in ['1', '1.0', 'S', 'SI', 'X', 'TRUE'] else 0
+
+                finca_raw = str(row.get('FINCA', 'Greenpack')).strip()
+                cant_raw = pd.to_numeric(row.get('CANTIDAD', 1), errors='coerce') or 1
+                dest_raw = str(row.get('DESTINO', 'UE')).strip().upper()
+                vis_raw = str(row.get('VISUAL', 'N/A')).strip().upper()
+                fecha_raw = str(row.get('FECHA', datetime.now().strftime('%d/%m/%Y'))).strip()
+
+                cursor.execute("""
+                    INSERT INTO tabla_maestra_final (codigo, fecha, finca, cantidad, destino, visual, volcado)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(codigo) DO UPDATE SET volcado = excluded.volcado
+                """, (codigo_clean, fecha_raw, finca_raw, cant_raw, dest_raw, vis_raw, volcado_final))
+            conn.commit()
+    except Exception:
+        pass
 
 # ============================================================
 # CSS
@@ -108,10 +224,6 @@ st.markdown("""
     }
     </style>
     """, unsafe_allow_html=True)
-# --- BUSCÁ ESTA PARTE O AGREGALA CERCA DEL PRINCIPIO ---
-def conectar_db():
-    return sqlite3.connect(DB_PATH) # Cambiado a ruta servidor
-
 
 def inicializar_db():
     with conectar_db() as conn:
@@ -130,18 +242,27 @@ def inicializar_db():
                 salida TEXT, horas REAL, estado TEXT, observacion TEXT
             )
         """)
+
 @st.cache_data(ttl=600)
 def cargar_datos_gerenciales():
     def leer_procesado(archivo):
-        # CAMBIO: Ahora busca en Y:\procesados
         ruta = os.path.join(CARPETA_PROCESADOS, archivo)
         if os.path.exists(ruta):
             try:
                 df = pd.read_csv(ruta, sep=';', encoding='latin-1')
                 df.columns = df.columns.str.strip()
                 return df
-            except: return pd.DataFrame()
-        return pd.DataFrame()
+            except: 
+                return pd.DataFrame()
+        else:
+            if archivo == 'productor por produccion.csv':
+                return pd.DataFrame(columns=['PRODUCTOR', 'PRODUCTOR_NOM', 'KG_NETOS', 'VARIEDAD'])
+            elif archivo == 'cajas.csv':
+                return pd.DataFrame(columns=['FECHA', 'CAJAS', 'CATEGORIA', 'COLOR'])
+            elif archivo == 'romaneo.csv':
+                return pd.DataFrame(columns=['CODIGO', 'PRODUCTOR', 'FINCA', 'COLOR', 'CANTIDAD'])
+            else:
+                return pd.DataFrame()
 
     datos = {
         "resumen": leer_procesado('productor por produccion.csv'),
@@ -151,20 +272,28 @@ def cargar_datos_gerenciales():
     }
     
     hoy = datetime.now().strftime('%d-%m-%Y')
-    with conectar_db() as conn:
-        try:
-            datos["paradas"] = pd.read_sql("SELECT * FROM registro_paradas WHERE fecha = ?", conn, params=(hoy,))
-        except:
-            datos["paradas"] = pd.DataFrame(columns=['duracion', 'fecha'])
-        try:
-            datos["asistencia"] = pd.read_sql("SELECT * FROM asistencia_diaria WHERE fecha = ?", conn, params=(hoy,))
-        except:
-            datos["asistencia"] = pd.DataFrame(columns=['horas', 'fecha'])
+    
+    try:
+        with conectar_db() as conn:
+            try:
+                datos["paradas"] = pd.read_sql("SELECT * FROM registro_paradas WHERE fecha = ?", conn, params=(hoy,))
+            except:
+                datos["paradas"] = pd.DataFrame(columns=['duracion', 'fecha', 'linea', 'equipo'])
+            
+            try:
+                datos["asistencia"] = pd.read_sql("SELECT * FROM asistencia_diaria WHERE fecha = ?", conn, params=(hoy,))
+            except:
+                datos["asistencia"] = pd.DataFrame(columns=['horas', 'fecha', 'operario', 'estado'])
+    except Exception:
+        datos["paradas"] = pd.DataFrame(columns=['duracion', 'fecha', 'linea', 'equipo'])
+        datos["asistencia"] = pd.DataFrame(columns=['horas', 'fecha', 'operario', 'estado'])
+        
     return datos
-## ============================================================
+
+# ============================================================
 # BASE DE DATOS — inicialización única y segura
 # ============================================================
-DB = DB_PATH # Usamos la constante del servidor definida arriba
+DB = DB_PATH 
 
 def init_db():
     conn = conectar_db()
@@ -197,7 +326,6 @@ def init_db():
         mercado TEXT, color TEXT, estado TEXT DEFAULT "En Playa"
     )''')
 
-    # Parchear columnas faltantes sin romper datos existentes
     columnas_extra = {
         "preseleccion": [
             ("fecha_ingreso", "TEXT"),
@@ -214,13 +342,14 @@ def init_db():
             try:
                 c.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
             except sqlite3.OperationalError:
-                pass  # ya existe
+                pass 
 
     c.execute("UPDATE preseleccion SET volcado='No' WHERE volcado IS NULL")
     conn.commit()
     conn.close()
 
 init_db()
+inicializar_db() # Corregido: Inicializa paradas y asistencia con el conector nuevo
 
 def inicializar_base_de_datos():
     with conectar_db() as conn:
@@ -235,7 +364,6 @@ def inicializar_base_de_datos():
         conn.commit()
 
 inicializar_base_de_datos()
-
 
 # ============================================================
 # CONSTANTES
@@ -261,40 +389,26 @@ rol = st.session_state.rol_actual
 # ============================================================
 # ALARMA DE LOTES CRÍTICOS (manejo seguro)
 # ============================================================
-
-# --- 1. FUNCIÓN PARA LEER LOS ARCHIVOS SIN ERRORES ---
 def cargar_dato(nombre):
     ruta = os.path.join(SERVIDOR_PATH, nombre)
     if os.path.exists(ruta):
         try:
-            # Leemos el archivo del servidor
             df = pd.read_csv(ruta, sep=None, engine='python', encoding='latin-1')
-            
-            # 1. Limpiamos nombres de columnas (sacamos espacios extra)
             df.columns = [c.strip() for c in df.columns]
-            
-            # 2. PARCHE DE SEGURIDAD:
-            # Si el código busca 'VISUAL' pero el archivo tiene 'visual', 
-            # creamos una copia para que no falle el cruce.
             if 'visual' in df.columns:
                 df['VISUAL'] = df['visual']
             elif 'VISUAL' not in df.columns:
-                # Si no existe de ninguna forma, la creamos vacía
                 df['VISUAL'] = "N/A"
-                
             return df
         except Exception as e:
             st.error(f"Error al leer {nombre}: {e}")
             return pd.DataFrame()
     return pd.DataFrame()
 
-# --- 2. EL DASHBOARD ---
-
 # ============================================================
 # BARRA LATERAL
 # ============================================================
 with st.sidebar:
-    # --- LOGO Y USUARIO ---
     st.write("##")
     try:
         st.image("logo_greenpack.png", use_container_width=True)
@@ -307,20 +421,15 @@ with st.sidebar:
         </div>
     """, unsafe_allow_html=True)
 
-    # --- CONFIGURACIÓN DINÁMICA DEL MENÚ ---
-    # 1. Definimos las listas básicas
     opciones = ["Inicio", "Preselección", "Producción", "Personal", "Muestras", "Reportes", "Configuracion"]
     iconos = ["house", "lemon", "gear", "people", "clipboard-check", "bar-chart", "sliders"]
-
-    # 2. Agregamos el Panel Gerencial SOLO si es santi_juarez
     
-    usuarios_permitidos = ["Santi_Juarez", "admin", "Santiago",]
+    usuarios_permitidos = ["Santi_Juarez", "admin", "Santiago"]
 
     if st.session_state.user_actual in usuarios_permitidos:
         opciones.append("Panel Gerencial")
-        iconos.append("graph-up") # Importante: mismo número de iconos que de opciones
+        iconos.append("graph-up")
 
-    # 3. CREACIÓN DEL MENÚ
     area = option_menu(
         None, 
         opciones, 
@@ -348,7 +457,6 @@ with st.sidebar:
 
     st.write("##")
 
-    # --- BOTÓN Y PIE DE PÁGINA ---
     if st.button("🚪 Cerrar Sesión", use_container_width=True):
         st.session_state.logueado = False
         st.rerun()
@@ -369,10 +477,9 @@ if area == "Inicio":
     st.write(f"Bienvenido al **Sistema de Gestión Greenpack**. Rol: `{st.session_state.get('rol_actual','Sin Rol')}`")
     st.markdown("---")
 
-    
     try:
-        # Forzamos la actualización de datos para que coincida con la nueva carga
-        st.cache_data.clear()
+        # 🚀 OPTIMIZACIÓN: Quitamos st.cache_data.clear() para no congelar la red Y:\
+        # Dejamos que el auto-refresco de 2 minutos traiga los bines en segundo plano.
 
         with conectar_db() as conn_inicio:
             # Traemos la fruta que está en stock (volcado = 0)
@@ -382,7 +489,7 @@ if area == "Inicio":
             # 1. NORMALIZACIÓN TOTAL
             df_fuente.columns = [str(c).strip().lower() for c in df_fuente.columns]
             
-            # Limpieza de códigos y duplicados (mismo motor que el Dashboard)
+            # Limpieza de códigos y duplicados
             df_fuente['codigo'] = df_fuente['codigo'].astype(str).str.strip().str.upper()
             df_fuente = df_fuente.drop_duplicates(subset=['codigo'], keep='last').copy()
 
@@ -398,7 +505,7 @@ if area == "Inicio":
             df_listos = df_fuente[mask_listos].copy()
 
             if not df_listos.empty:
-                st.markdown("<h3 style='color: #1E3A8A;'>🍋 Bines listos para procesar hoy (A + P)</h3>", unsafe_allow_html=True)
+                st.markdown("<h3 style='color: #1c83e1;'>🍋 Bines en stock listos para procesar hoy (A + P)</h3>", unsafe_allow_html=True)
 
                 # --- 3. LÓGICA DE MÉTRICAS ACTUALIZADA ---
                 def get_datos_final(destino_id, df):
@@ -428,7 +535,7 @@ if area == "Inicio":
 
                 # Métrica General
                 total_bins_listos = b_ue + b_usa + b_noue
-                st.metric("TOTAL BINES LISTOS (Hoy)", f"{total_bins_listos} Bins")
+                st.metric("TOTAL BINES REALES EN STOCK (Hoy)", f"{total_bins_listos} Bins")
 
                 # RENDERIZADO DE TARJETAS
                 m1, m2, m3 = st.columns(3)
@@ -453,20 +560,20 @@ if area == "Inicio":
                             </div>
                         """, unsafe_allow_html=True)
             else:
-                st.info("No hay bines en estado A o P para procesar hoy.")
+                st.info("No hay bines reales en stock con estado A o P para procesar hoy.")
         else:
-            st.warning("No hay bines en stock (volcado=0).")
+            st.warning("No se encontraron bines activos en stock (volcado=0) en la base de datos.")
 
     except Exception as e:
         st.error(f"Error en tarjetas de inicio: {e}")
 
     # Simulador de proyección
     with st.expander("🔮 Simulador de Proyección Estratégica", expanded=True):
-        st.markdown("### Configuración de Cosecha")
+        st.markdown("### Configuración de Cosecha Proyectada")
     
-    # Asegúrate de que LISTA_FINCAS esté definida en tu código global
+    # Aseguramos que LISTA_FINCAS exista de forma segura
     if 'LISTA_FINCAS' not in locals():
-        LISTA_FINCAS = ["Finca Claudia", "Finca El Molino", "Yaquilo", "Antamapu", "La Luz"]
+        LISTA_FINCAS = ["30 zuccardi","Antamapu","Greenpack","Greyco","Yaquilo"]
 
     # Inicialización del session_state
     if "frentes_cosecha" not in st.session_state:
@@ -483,8 +590,6 @@ if area == "Inicio":
         st.rerun()
 
     frentes_para_borrar = []
-    
-    # Variables para acumular el resultado final de TODOS los frentes
     bins_listos_totales = 0
     rend_acumulado = 0
 
@@ -502,7 +607,7 @@ if area == "Inicio":
             frente["bins"] = col_c2.number_input("Bins por día", value=frente.get("bins", 100), min_value=1, key=f"nbins_{i}")
             frente["rendimiento"] = col_c3.slider("Rendimiento %", 0, 100, frente.get("rendimiento", 80), key=f"rend_{i}")
             
-            # SLIDER INDIVIDUAL (Limitado de 0 a 7 días como pediste)
+            # SLIDER INDIVIDUAL
             frente["dias"] = st.select_slider(
                 f"Días a proyectar para {frente['finca']}", 
                 options=[0, 1, 2, 3, 4, 5, 6, 7], 
@@ -522,13 +627,8 @@ if area == "Inicio":
             check_suma = frente["p_vo"] + frente["p_v"] + frente["p_vc"] + frente["p_p"] + frente["p_a"]
             
             if check_suma == 100:
-                # 1. Calculamos los Bins Netos Totales de este frente (sin importar el color todavía)
-                # Fórmula: Bins/Día * Rendimiento * Coeficiente 1.085
-                # Nota: Aquí no multiplicamos por días todavía porque los días determinan qué COLOR entra
                 bn_diario = (frente["bins"] * (frente["rendimiento"] / 100) * 1.085)
                 
-                # 2. Aplicamos tu LÓGICA DE DÍAS a este frente específico
-                # b_a (Amarillo) siempre entra. Los demás dependen del slider de este frente.
                 b_a  = bn_diario * (frente["p_a"] / 100)
                 b_p  = bn_diario * (frente["p_p"] / 100)
                 b_vc = bn_diario * (frente["p_vc"] / 100)
@@ -541,7 +641,6 @@ if area == "Inicio":
                 if frente["dias"] >= 6: frente_listos += b_v
                 if frente["dias"] >= 7: frente_listos += b_vo
                 
-                # Sumamos al acumulador total (esto suma todos los frentes)
                 bins_listos_totales += frente_listos
                 rend_acumulado += frente["rendimiento"]
                 
@@ -549,7 +648,6 @@ if area == "Inicio":
             else:
                 st.error(f"⚠️ Suma: {check_suma}% (Debe ser 100%)")
 
-    # Lógica de borrado
     if frentes_para_borrar:
         for idx in sorted(frentes_para_borrar, reverse=True):
             st.session_state.frentes_cosecha.pop(idx)
@@ -563,7 +661,6 @@ if area == "Inicio":
         kilos_finales = bins_finales * 370
         rend_promedio = rend_acumulado / len(st.session_state.frentes_cosecha)
 
-        # Tus fórmulas eval()
         fa, fb, fc = st.columns(3)
         f_bins    = fa.text_input("Fórmula Bins", value="bins", key="f_bins")
         f_kilos   = fb.text_input("Fórmula Kilos", value="bins * 370", key="f_kilos")
@@ -580,20 +677,20 @@ if area == "Inicio":
         res_k, err_k = evaluar(f_kilos, vars_f)
         res_p, err_p = evaluar(f_pallets, vars_f)
 
-        st.subheader("📊 Resultado Consolidado (Suma de todos los frentes)")
+        st.subheader("📊 Resultado Consolidado Proyectado (Suma de frentes)")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Bins Totales", f"{math.ceil(res_b)}" if not err_b else "❌")
         m2.metric("Kilos Est.", f"{int(res_k):,} kg" if not err_k else "❌")
         if not err_p:
-            m3.metric("Pallet Alto", f"{round(res_p/1.3, 1)}")
-            m4.metric("Pallet Bajo", f"{round(res_p/1.2, 1)}")
+            m3.metric("Pallet Alto (x72)", f"{round(res_p/1.3, 1)}")
+            m4.metric("Pallet Bajo (x63)", f"{round(res_p/1.2, 1)}")
 
-    # Filtros y exportación
-    with st.expander("🔍 Filtros de Detalle y Exportación", expanded=False):
+    with st.expander("🔍 Filtros de Detalle y Exportación Real", expanded=False):
         with conectar_db() as conn_exp:
-            df_f = pd.read_sql_query(
-                "SELECT DISTINCT productor, destino FROM preseleccion WHERE volcado='No'", conn_exp)
+            
+            df_f = pd.read_sql_query("SELECT DISTINCT productor, destino FROM tabla_maestra_final WHERE volcado=0 OR volcado='0'", conn_exp)
             df_f.columns = [str(c).strip().lower() for c in df_f.columns]
+            
             prod_unicos = sorted([str(x) for x in df_f['productor'].dropna().unique()])
             dest_unicos = sorted([str(x) for x in df_f['destino'].dropna().unique()])
 
@@ -601,16 +698,44 @@ if area == "Inicio":
             sel_p = f1.selectbox("Productor:", ["Todos"] + prod_unicos, key="exp_prod")
             sel_d = f2.selectbox("Destino:",   ["Todos"] + dest_unicos, key="exp_dest")
 
-            q = "SELECT * FROM preseleccion WHERE volcado='No'"
+            # Aseguramos un salvavidas si la columna fecha desapareció
+            q = """
+            SELECT 
+                codigo AS [Código], 
+                COALESCE(fecha, 'Sin Fecha') AS [Fecha], 
+                finca AS [Finca], 
+                cantidad AS [Cantidad], 
+                destino AS [Destino], 
+                visual AS [Visual] 
+            FROM tabla_maestra_final 
+            WHERE (volcado=0 OR volcado='0')
+            """
+            
             if sel_p != "Todos": q += f" AND productor='{sel_p}'"
             if sel_d != "Todos": q += f" AND destino='{sel_d}'"
-            df_exp = pd.read_sql_query(q, conn_exp)
-            st.dataframe(df_exp, use_container_width=True)
+            
+            # Bloque de lectura con escudo anti-errores de estructura
+            try:
+                df_exp = pd.read_sql_query(q, conn_exp)
+            except Exception:
+                # Si 'fecha' rompe totalmente el motor SQL, la removemos de la query en caliente
+                q_emergencia = "SELECT codigo AS [Código], finca AS [Finca], cantidad AS [Cantidad], destino AS [Destino], visual AS [Visual] FROM tabla_maestra_final WHERE (volcado=0 OR volcado='0')"
+                if sel_p != "Todos": q_emergencia += f" AND productor='{sel_p}'"
+                if sel_d != "Todos": q_emergencia += f" AND destino='{sel_d}'"
+                df_exp = pd.read_sql_query(q_emergencia, conn_exp)
+                # Le creamos la columna vacía en Python para que el resto del código no falle
+                df_exp['Fecha'] = "Revisar Excel"
+
+            # PROTECCIÓN CONTRA EL ERROR 's/n' (Tu código de la foto que quedó perfecto)
+            for col in df_exp.columns:
+                if 'PALLET' in str(col).upper():
+                    df_exp[col] = df_exp[col].astype(str).str.strip().replace('nan', '')
+
+            # Mostramos la tabla limpia usando el formato de ancho correcto
+            st.dataframe(df_exp, width="stretch", hide_index=True)
+            
             csv = df_exp.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Descargar CSV", data=csv, file_name="Reporte.csv", mime="text/csv")
-
-
-# ============================================================
+            st.download_button("📥 Descargar Reporte Stock Actual (CSV)", data=csv, file_name="Stock_Real_Greenpack.csv", mime="text/csv")
 # PRESELECCIÓN (VERSION CALIBRADA CON FILTROS DINÁMICOS CRUZADOS)
 # ============================================================
 elif area == "Preselección":
@@ -628,55 +753,96 @@ elif area == "Preselección":
         conn.commit()
 
     # ----------------------------------------------------------
-    # 1. INGRESO DE FRUTA (CONEXIÓN EN VIVO A EXCEL + EDICIÓN)
+    # 1. INGRESO DE FRUTA (CRUCE DE ARCHIVOS EN CALIENTE)
     # ----------------------------------------------------------
     if selected == "1. Ingreso de fruta":
-        st.header("📝 Libro de Ingreso de Fruta (Lectura en Vivo)")
+        st.header("📝 Libro de Ingreso de Fruta (Sincronización en Vivo)")
 
-        # RUTAS DEL ARCHIVO PARTE DIARIO
+        # RUTAS DE LOS DOS ARCHIVOS EN LA RED
         ruta_red_parte = r"Y:\Despacho\APP_GREENPACK\datos_origen\Parte diario 2025.xlsx"
+        ruta_red_volcado = r"Y:\Despacho\APP_GREENPACK\datos_origen\volcado Produccion 2025.xlsx"
+
+        # RUTAS LOCALES TEMPORALES
         ruta_local_parte = os.path.join(os.getcwd(), "parte_diario_local.xlsx")
-        ruta_desencriptado_parte = os.path.join(os.getcwd(), "parte_diario_libre.xlsx")
+        ruta_local_volcado = os.path.join(os.getcwd(), "volcado_local.xlsx")
+        
+        ruta_libre_parte = os.path.join(os.getcwd(), "parte_diario_libre.xlsx")
+        ruta_libre_volcado = os.path.join(os.getcwd(), "volcado_libre.xlsx")
 
         df_excel = None
+        set_codigos_volcados = set()
 
-        # --- 1. ESCUDO DE RED: COPIA EN CALIENTE ---
+        # --- 1. COPIA EN CALIENTE DESDE LA RED ---
+        import shutil
         try:
             if os.path.exists(ruta_red_parte):
-                import shutil
                 shutil.copy2(ruta_red_parte, ruta_local_parte)
+            if os.path.exists(ruta_red_volcado):
+                shutil.copy2(ruta_red_volcado, ruta_local_volcado)
         except Exception:
             pass
 
-        # --- 2. DESENCRIPTACIÓN AUTOMÁTICA (ROCKO1) ---
-        archivo_a_descifrar = ruta_local_parte if os.path.exists(ruta_local_parte) else ruta_red_parte
+        # Definir cuáles archivos procesar (Red o Local de emergencia)
+        f_parte_origen = ruta_local_parte if os.path.exists(ruta_local_parte) else ruta_red_parte
+        f_volcado_origen = ruta_local_volcado if os.path.exists(ruta_local_volcado) else ruta_red_volcado
 
-        if os.path.exists(archivo_a_descifrar):
-            with st.spinner("🔄 Sincronizando datos en vivo desde el Parte Diario de red..."):
+        # --- 2. PROCESAMIENTO EN PARALELO DE AMBOS EXCEL ---
+        if os.path.exists(f_parte_origen):
+            with st.spinner("🔄 Cruzando bases de datos de empaque en tiempo real..."):
+                import msoffcrypto
+                
+                # A) LEER ARCHIVO DE VOLCADOS (Para armar el buscador de códigos)
+                if os.path.exists(f_volcado_origen):
+                    try:
+                        with open(f_volcado_origen, "rb") as f_enc:
+                            file_v = msoffcrypto.OfficeFile(f_enc)
+                            file_v.load_key(password="ROCKO1")
+                            with open(ruta_libre_volcado, "wb") as f_dec:
+                                file_v.decrypt(f_dec)
+                        
+                        if os.path.exists(ruta_libre_volcado):
+                            with pd.ExcelFile(ruta_libre_volcado, engine="openpyxl") as xl_lector:
+                                lista_hojas = xl_lector.sheet_names
+                                pestaña_correcta = None
+                                for hoja in lista_hojas:
+                                    if "VOLC" in str(hoja).strip().upper():
+                                        pestaña_correcta = hoja
+                                        break
+                                
+                                if not pestaña_correcta and lista_hojas:
+                                    pestaña_correcta = lista_hojas[0]
+                                
+                                df_v_prod = pd.read_excel(xl_lector, sheet_name=pestaña_correcta)
+                            
+                            df_v_prod.columns = [str(c).strip().upper() for c in df_v_prod.columns]
+                            col_c_v = 'CODIGO' if 'CODIGO' in df_v_prod.columns else df_v_prod.columns[0]
+                            
+                            codigos_sucios = df_v_prod[col_c_v].dropna().astype(str).str.strip().str.upper().unique()
+                            set_codigos_volcados = set(codigos_sucios)
+                            
+                            os.remove(ruta_libre_volcado)
+                    except Exception as e:
+                        st.warning(f"⚠️ No se pudo cruzar con Volcados (se mostrará como pendiente): {e}")
+
+                # B) LEER EL PARTE DIARIO PRINCIPAL
                 try:
-                    import msoffcrypto
-                    with open(archivo_a_descifrar, "rb") as f_encrypted:
-                        office_file = msoffcrypto.OfficeFile(f_encrypted)
-                        office_file.load_key(password="ROCKO1")
-                        with open(ruta_desencriptado_parte, "wb") as f_decrypted:
-                            office_file.decrypt(f_decrypted)
-
-                    # --- 3. LECTURA DE LA HOJA 'PARTE' ---
-                    if os.path.exists(ruta_desencriptado_parte):
-                        df_excel = pd.read_excel(ruta_desencriptado_parte, sheet_name="PARTE", engine="openpyxl")
-                        try:
-                            os.remove(ruta_desencriptado_parte)
-                        except Exception:
-                            pass
+                    with open(f_parte_origen, "rb") as f_enc:
+                        file_p = msoffcrypto.OfficeFile(f_enc)
+                        file_p.load_key(password="ROCKO1")
+                        with open(ruta_libre_parte, "wb") as f_dec:
+                            file_p.decrypt(f_dec)
+                    
+                    if os.path.exists(ruta_libre_parte):
+                        df_excel = pd.read_excel(ruta_libre_parte, sheet_name="PARTE", engine="openpyxl")
+                        os.remove(ruta_libre_parte)
                 except Exception as e:
-                    st.error(f"❌ Error al desencriptar o leer el Excel: {e}")
+                    st.error(f"❌ Error al abrir el Parte Diario de Óscar: {e}")
         else:
-            st.warning(f"⚠️ No se detectó el archivo en red: {ruta_red_parte}")
+            st.warning("⚠️ Archivo de Parte Diario no encontrado en la ruta de red.")
 
-        # --- 4. ALIMENTACIÓN / ACTUALIZACIÓN DE SQLITE ---
+        # --- 3. ACTUALIZACIÓN DE SQLITE CON EL CRUCE HECHO POR PYTHON ---
         if df_excel is not None:
             try:
-                # Limpiamos nombres de columnas del Excel de Oscar
                 df_excel.columns = [str(c).strip().upper() for c in df_excel.columns]
                 df_excel = df_excel[df_excel['CODIGO'].notna()]
 
@@ -688,41 +854,48 @@ elif area == "Preselección":
                         if codigo_clean in ['', 'NAN', 'NONE']:
                             continue
 
-                        # Procesamiento inteligente de fechas
                         def formatear_fecha(val):
+                            if pd.isna(val): return None
                             v = str(val).strip().lower()
                             if v in ["", "nan", "none", "0"]: return None
                             try:
-                                meses = {'jan':'01','feb':'02','mar':'03','apr':'04','may':'05','jun':'06',
-                                         'jul':'07','aug':'08','sep':'09','oct':'10','nov':'11','dec':'12',
-                                         'ene':'01','abr':'04','ago':'08','dic':'12'}
-                                for esp, num in meses.items():
-                                    if esp in v:
-                                        dia = v.split('-')[0].strip().zfill(2)
-                                        return f"2026-{num}-{dia}"
-                                return pd.to_datetime(v, dayfirst=True).strftime('%Y-%m-%d')
+                                # Si ya es una fecha legible por pandas
+                                return pd.to_datetime(val).strftime('%Y-%m-%d')
                             except:
-                                return v
+                                try:
+                                    meses = {'jan':'01','feb':'02','mar':'03','apr':'04','may':'05','jun':'06',
+                                             'jul':'07','aug':'08','sep':'09','oct':'10','nov':'11','dec':'12',
+                                             'ene':'01','abr':'04','ago':'08','dic':'12'}
+                                    for esp, num in meses.items():
+                                        if esp in v:
+                                            dia = v.split('-')[0].strip().zfill(2)
+                                            return f"2026-{num}-{dia}"
+                                    return pd.to_datetime(v, dayfirst=True).strftime('%Y-%m-%d')
+                                except:
+                                    return v
 
                         f_parte = formatear_fecha(row.get('FECHA DE PARTE', ''))
                         f_cosecha = formatear_fecha(row.get('FECHA DE COSECHA', ''))
 
-                        # Mapeo de Volcado y Cantidad numérica
-                        v_prod_raw = str(row.get('VOLCADO A PROD.', '0')).replace(',', '.')
-                        try: volcado_final = 1 if float(v_prod_raw) >= 1 else 0
-                        except: volcado_final = 0
+                        # 🎯 EL VERDADERO CRUCE EN CALIENTE
+                        if codigo_clean in set_codigos_volcados:
+                            volcado_final = 1
+                        else:
+                            v_raw = str(row.get('VOLCADO A PROD.', '0')).strip().upper()
+                            if v_raw in ['1', '1.0', 'S', 'SI', 'X', 'TRUE']:
+                                volcado_final = 1
+                            else:
+                                volcado_final = 0
 
                         cant_val = str(row.get('CANTIDAD', '0')).replace(',', '.')
                         try: cantidad_final = float(cant_val)
                         except: cantidad_final = 0
 
-                        # Sincronización Espejo: Insertamos si no existe. 
-                        # Si ya existe, actualizamos todo MENOS el 'visual' y 'calidad' para no pisar tu trabajo manual.
                         cursor.execute("""
                             INSERT INTO tabla_maestra_final (
                                 codigo, fecha_de_parte, fecha_de_cosecha, camara, fila, 
                                 destino, up, color, cantidad, finca, productor, volcado, visual, calidad
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'S/D', 'N/A')
                             ON CONFLICT(codigo) DO UPDATE SET
                                 fecha_de_parte = excluded.fecha_de_parte,
                                 fecha_de_cosecha = excluded.fecha_de_cosecha,
@@ -745,15 +918,13 @@ elif area == "Preselección":
                             cantidad_final,
                             str(row.get('FINCA', '')).strip(),
                             str(row.get('PRODUTOR', 'A MARES')).strip().upper(),
-                            volcado_final,
-                            str(row.get('A', 'N/A')).strip().upper(), # Por defecto usa el del excel si es nuevo
-                            str(row.get('CALIDAD', 'N/A')).strip().upper()
+                            volcado_final
                         ))
                     conn.commit()
             except Exception as e:
-                st.error(f"❌ Error al procesar matriz de datos en vivo: {e}")
+                st.error(f"❌ Error en matriz de sincronización: {e}")
 
-        # --- 5. LECTURA FINAL PARA MOSTRAR EN PANTALLA ---
+        # --- 4. LECTURA DESDE LA BASE DE DATOS Y RENDERIZADO ---
         df_view = pd.DataFrame()
         try:
             with conectar_db() as conn:
@@ -762,10 +933,12 @@ elif area == "Preselección":
             pass
 
         if not df_view.empty:
-            # Normalización para filtros cruzados de la App
             df_view['productor'] = df_view['productor'].astype(str).str.strip().str.upper()
             df_view['finca'] = df_view['finca'].astype(str).str.strip().str.upper()
             df_view['color'] = df_view['color'].astype(str).str.strip().str.upper()
+
+            # Mapeamos internamente a Booleanos para no romper la consistencia de la tabla interactiva
+            df_view['volcado'] = df_view['volcado'].apply(lambda x: True if str(x) in ['1', '1.0', 'True'] else False)
 
             # PANEL DE FILTROS AVANZADOS MULTISELECCIÓN
             with st.expander("🔍 PANEL DE FILTROS AVANZADOS (Multiselección)", expanded=True):
@@ -782,16 +955,16 @@ elif area == "Preselección":
                     list_col = sorted([x for x in df_temp_c['color'].unique() if x not in ['NAN', '']])
                     col_sel = st.multiselect("Filtrar Color:", list_col, placeholder="Todos")
                 with c4:
-                    f_volcado = st.selectbox("Estado Volcado:", ["TODOS", "PENDIENTE (0)", "VOLCADO (1)"])
+                    f_volcado = st.selectbox("Estado Volcado:", ["TODOS", "PENDIENTE (❌ NO)", "VOLCADO (🟢 SÍ)"])
 
-            # Aplicamos filtros
             dff = df_view.copy()
             if prod_sel: dff = dff[dff['productor'].isin(prod_sel)]
             if finca_sel: dff = dff[dff['finca'].isin(finca_sel)]
             if col_sel: dff = dff[dff['color'].isin(col_sel)]
             
-            if f_volcado == "PENDIENTE (0)": dff = dff[dff['volcado'] == 0]
-            elif f_volcado == "VOLCADO (1)": dff = dff[dff['volcado'] == 1]
+            # 🚀 CORRECCIÓN: Filtro inteligente adaptado al tipo booleano del editor
+            if f_volcado == "PENDIENTE (❌ NO)": dff = dff[dff['volcado'] == False]
+            elif f_volcado == "VOLCADO (🟢 SÍ)": dff = dff[dff['volcado'] == True]
 
             orden = [
                 'codigo', 'fecha_de_parte', 'camara', 'fila', 'visual', 'calidad',
@@ -801,21 +974,20 @@ elif area == "Preselección":
 
             st.markdown("### 📊 Tablero de Control de Bines (Podés modificar 'Visual' y 'Calidad')")
 
-            # EDITOR INTERACTIVO CON COMBOS DESPLEGABLES
             df_editado = st.data_editor(
                 dff[cols_finales],
                 use_container_width=True,
                 hide_index=True,
-                key="editor_vivo_preseleccion",
+                key="editor_vivo_final_real",
                 column_config={
-                    "visual": st.column_config.SelectboxColumn("Visual (Maduración)", options=["VO", "V", "VC", "P", "A"], required=True),
+                    "codigo": st.column_config.TextColumn("Código de Bin", disabled=True),
+                    "visual": st.column_config.SelectboxColumn("Visual (Maduración)", options=["VO", "V", "VC", "P", "A", "S/D"], required=True),
                     "calidad": st.column_config.SelectboxColumn("Calidad", options=["EXPORTACION", "MERCADO", "DESCARTE", "N/A"]),
                     "volcado": st.column_config.CheckboxColumn("Volcado ✔️"),
                     "cantidad": st.column_config.NumberColumn("Bins", disabled=True)
                 }
             )
 
-            # BOTÓN DE GUARDADO SEGURO
             if st.button("💾 Guardar Modificaciones Manuales", use_container_width=True):
                 try:
                     with conectar_db() as conn:
@@ -832,10 +1004,10 @@ elif area == "Preselección":
                                 str(fila['codigo']).strip().upper()
                             ))
                         conn.commit()
-                    st.success("✅ ¡Cambios guardados con éxito! Datos sincronizados.")
+                    st.success("✅ ¡Cambios guardados con éxito! Datos unificados.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"❌ Error al guardar modificaciones: {e}")
+                    st.error(f"❌ Error al guardar: {e}")
 
             st.caption(f"Mostrando {len(dff)} bines activos.")
 
@@ -847,22 +1019,6 @@ elif area == "Preselección":
         st_autorefresh(interval=60000, key="refresh_piso_minuto")
 
         st.header("📦 Stock en Cámaras (Piso)")
-
-        if st.button("🔄 Sincronizar y Limpiar Duplicados", use_container_width=True):
-            try:
-                with conectar_db() as conn:
-                    conn.execute("""
-                        DELETE FROM tabla_maestra_final 
-                        WHERE rowid NOT IN (
-                            SELECT MIN(rowid) FROM tabla_maestra_final GROUP BY codigo
-                        )
-                    """)
-                    conn.commit()
-                st.cache_data.clear() 
-                st.success("✅ Datos sincronizados correctamente.")
-                st.rerun() 
-            except Exception as e:
-                st.error(f"Error: {e}")
 
         try:
             with conectar_db() as conn:
@@ -926,10 +1082,10 @@ elif area == "Preselección":
         from streamlit_autorefresh import st_autorefresh
         import plotly.express as px
         
-        st_autorefresh(interval=3600000, key="datarefresh") 
-        st.cache_data.clear()
+        # Auto-refresco cada 5 minutos de forma limpia sin romper la caché global
+        st_autorefresh(interval=300000, key="datarefresh_dashboard") 
         
-        st.info("⏳ Los datos de este tablero se actualizan al cierre de cada turno.")
+        st.info("⏳ Los datos de este tablero reflejan el estado del stock real en tiempo de ejecución.")
         st.markdown("<h1 style='text-align: center; color: #1E3A8A;'>📊 Panel de Control Operativo</h1>", unsafe_allow_html=True)
 
         try:
@@ -997,15 +1153,14 @@ elif area == "Preselección":
 
             # --- PROYECCIÓN INTERACTIVA DE MADURACIÓN ---
             tiempos = {'VO': 7, 'V': 5, 'VC': 3, 'P': 2, 'A': 0}
-            dias_sim = st.select_slider("📅 Proyectar maduración (Días simulados):", options=[0, 1, 2, 3, 5, 7], value=0)
+            dias_sim = st.select_slider("📅 Proyectar maduración (Días simulados de permanencia):", options=[0, 1, 2, 3, 5, 7], value=0)
 
             def calcular_proyeccion(v_orig, dias_t):
                 v_orig = str(v_orig).upper().strip()
                 if v_orig not in tiempos: return v_orig
                 return 'A' if dias_t >= tiempos.get(v_orig, 5) else v_orig
 
-            col_v = 'visual' if 'visual' in df_dash.columns else 'color'
-            df_dash['visual_proyectada'] = df_dash[col_v].apply(lambda x: calcular_proyeccion(x, dias_sim))
+            df_dash['visual_proyectada'] = df_dash[col_target].apply(lambda x: calcular_proyeccion(x, dias_sim))
 
             st.divider()
             mercados_config = [
